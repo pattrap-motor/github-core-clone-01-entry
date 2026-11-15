@@ -47,8 +47,16 @@ function nextTimestamp(): number {
   clockSeq += 1;
   return 1_700_000_000 + clockSeq;
 }
+/** isoOf is a pure function of its argument; memoise it (timestamps repeat a lot:
+ * created_at/updated_at pairs, per-repo epochs). Byte-identical output. */
+const isoCache = new Map<number, string>();
 function isoOf(tsSeconds: number): string {
-  return new Date(tsSeconds * 1000).toISOString();
+  const hit = isoCache.get(tsSeconds);
+  if (hit !== undefined) return hit;
+  const value = new Date(tsSeconds * 1000).toISOString();
+  if (isoCache.size >= 8192) isoCache.clear();
+  isoCache.set(tsSeconds, value);
+  return value;
 }
 
 function sha1Hex(data: Buffer): string {
@@ -176,7 +184,7 @@ interface IssueRec {
   comments: CommentRec[];
   createdTs: number;
   /** Memoised REST JSON for this issue, with the rendered fields it was built from. */
-  jsonCache?: { title: string; body: string; state: string; labelsJoined: string; commentsLength: number; labelEpoch: number; buf: Buffer };
+  jsonCache?: { title: string; body: string; state: string; labelsRef: string[]; commentsLength: number; labelEpoch: number; buf: Buffer };
 }
 
 interface PullRec {
@@ -596,6 +604,11 @@ function newWalkTable(size: number): WalkTable {
   return { lut: new Int32Array(WALK_LUT_SIZE), counts: new Int32Array(16), symbols: new Int32Array(size), maxLen: 0 };
 }
 
+/** Scratch for buildWalkTable (it is never re-entered: table builds never nest). */
+const WALK_OFFSETS = new Int32Array(16);
+const WALK_CURSOR = new Int32Array(16);
+const WALK_NEXT = new Int32Array(16);
+
 /** (Re)build a canonical Huffman table + LUT from per-symbol code lengths. */
 function buildWalkTable(table: WalkTable, lengths: ArrayLike<number>, size: number): void {
   const { counts, symbols, lut } = table;
@@ -612,9 +625,10 @@ function buildWalkTable(table: WalkTable, lengths: ArrayLike<number>, size: numb
     }
   }
   table.maxLen = maxLen;
-  const offsets = new Int32Array(16);
+  const offsets = WALK_OFFSETS;
   for (let i = 1; i < 16; i += 1) offsets[i] = offsets[i - 1]! + counts[i - 1]!;
-  const cursor = Int32Array.from(offsets);
+  const cursor = WALK_CURSOR;
+  cursor.set(offsets);
   for (let s = 0; s < size; s += 1) {
     const len = lengths[s]!;
     if (len > 0) {
@@ -623,7 +637,7 @@ function buildWalkTable(table: WalkTable, lengths: ArrayLike<number>, size: numb
     }
   }
   // Canonical codes, assigned in (length, symbol) order — the order of `symbols`.
-  const next = new Int32Array(16);
+  const next = WALK_NEXT;
   let code = 0;
   for (let len = 1; len < 16; len += 1) {
     code = (code + counts[len - 1]!) << 1;
@@ -1932,6 +1946,10 @@ const issueRestIds = new Map<string, number>();
  * fingerprint of every value issueJson renders (its fields, its comment count, and the
  * repo's label epoch for the colours), so any mutation — REST, GraphQL or MCP, they all
  * write these same fields — misses the cache and re-renders. Byte-identical output.
+ * The labels fingerprint is the array reference itself: issue.labels is only ever
+ * replaced wholesale (creation copies the input, updates assign a fresh array) and
+ * never mutated in place anywhere in this file, so reference equality is exact —
+ * it replaces a per-call join() allocation on the read hot path.
  */
 function issueJsonBuffer(repo: Repo, issue: IssueRec): Buffer {
   const cached = issue.jsonCache;
@@ -1942,7 +1960,7 @@ function issueJsonBuffer(repo: Repo, issue: IssueRec): Buffer {
     cached.state === issue.state &&
     cached.commentsLength === issue.comments.length &&
     cached.labelEpoch === repo.labelEpoch &&
-    cached.labelsJoined === issue.labels.join('\u0001')
+    cached.labelsRef === issue.labels
   ) {
     return cached.buf;
   }
@@ -1951,7 +1969,7 @@ function issueJsonBuffer(repo: Repo, issue: IssueRec): Buffer {
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    labelsJoined: issue.labels.join('\u0001'),
+    labelsRef: issue.labels,
     commentsLength: issue.comments.length,
     labelEpoch: repo.labelEpoch,
     buf,
