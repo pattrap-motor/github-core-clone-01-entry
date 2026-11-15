@@ -172,6 +172,8 @@ interface IssueRec {
   labels: string[];
   comments: CommentRec[];
   createdTs: number;
+  /** Memoised REST JSON for this issue, keyed by a fingerprint of every field it renders. */
+  jsonCache?: { key: string; buf: Buffer };
 }
 
 interface PullRec {
@@ -202,6 +204,8 @@ interface Repo {
   issues: Map<number, IssueRec>;
   pulls: Map<number, PullRec>;
   labels: Map<string, { name: string; color: string }>;
+  /** Bumped whenever a label is created, so cached issue JSON (which embeds label colours) stays honest. */
+  labelEpoch: number;
   nextNumber: number;
   nextCommentId: number;
   packCache: Map<string, Buffer>;
@@ -232,6 +236,7 @@ function createRepoRec(owner: string, name: string, description: string, isPriva
     issues: new Map(),
     pulls: new Map(),
     labels: new Map(),
+    labelEpoch: 0,
     nextNumber: 1,
     nextCommentId: 1,
     packCache: new Map(),
@@ -518,12 +523,158 @@ function buildPack(repo: Repo, oids: string[]): Buffer {
   return Buffer.concat([body, trailer]);
 }
 
+const LEN_EXT: readonly number[] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_EXT: readonly number[] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CLEN_ORDER: readonly number[] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
 /**
- * Inflate one pack entry starting at `pos`. inflateSync tolerates trailing bytes but
- * throws on a truncated stream, so the consumed length is the smallest length that
- * inflates — found by binary search.
+ * The exact byte length of the zlib stream starting at `buf[pos]`, found by walking the
+ * deflate bitstream (block headers and Huffman symbols) without decoding any payload.
+ * Returns -1 when the stream does not parse; callers fall back to probing inflateSync.
+ * The walk never reads at or past `limit`.
+ */
+function zlibStreamLength(buf: Buffer, pos: number, limit: number): number {
+  if (pos + 6 > limit) return -1;
+  if ((buf[pos]! & 0x0f) !== 8) return -1; // CMF: compression method must be deflate
+  let bitpos = 0; // bits consumed in the deflate stream (which starts after the 2-byte zlib header)
+  const byteAt = (index: number): number => buf[pos + 2 + index]!;
+  const getbit = (): number => {
+    const byteIndex = bitpos >> 3;
+    if (pos + 2 + byteIndex >= limit) throw new Error('deflate stream overruns the pack');
+    const bit = (byteAt(byteIndex) >> (bitpos & 7)) & 1;
+    bitpos += 1;
+    return bit;
+  };
+  const getbits = (count: number): number => {
+    let value = 0;
+    for (let i = 0; i < count; i += 1) value |= getbit() << i;
+    return value;
+  };
+  interface HuffTable {
+    counts: number[];
+    symbols: number[];
+  }
+  const buildTable = (lengths: readonly number[]): HuffTable => {
+    const counts = new Array<number>(16).fill(0);
+    for (const length of lengths) if (length > 0) counts[length]! += 1;
+    const offsets = new Array<number>(16).fill(0);
+    for (let i = 1; i < 16; i += 1) offsets[i] = offsets[i - 1]! + counts[i - 1]!;
+    const symbols = new Array<number>(lengths.length);
+    lengths.forEach((length, symbol) => {
+      if (length > 0) {
+        symbols[offsets[length]!] = symbol;
+        offsets[length]! += 1;
+      }
+    });
+    return { counts, symbols };
+  };
+  const decode = (table: HuffTable): number => {
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    for (let length = 1; length < 16; length += 1) {
+      code |= getbit();
+      const count = table.counts[length]!;
+      if (code - first < count) return table.symbols[index + (code - first)]!;
+      index += count;
+      first = (first + count) << 1;
+      code <<= 1;
+    }
+    throw new Error('invalid Huffman code in deflate stream');
+  };
+  try {
+    for (;;) {
+      const bfinal = getbit();
+      const btype = getbits(2);
+      if (btype === 0) {
+        // Stored block: skip to a byte boundary, then LEN/NLEN and LEN payload bytes.
+        bitpos = (bitpos + 7) & ~7;
+        const lenAt = bitpos >> 3;
+        if (pos + 2 + lenAt + 4 > limit) return -1;
+        const len = byteAt(lenAt) | (byteAt(lenAt + 1) << 8);
+        const nlen = byteAt(lenAt + 2) | (byteAt(lenAt + 3) << 8);
+        if (len !== (~nlen & 0xffff)) return -1;
+        bitpos += 32 + len * 8;
+        if (pos + 2 + (bitpos >> 3) > limit) return -1;
+      } else if (btype === 1 || btype === 2) {
+        let litTable: HuffTable;
+        let distTable: HuffTable;
+        if (btype === 1) {
+          const litLengths = new Array<number>(288);
+          for (let i = 0; i < 288; i += 1) litLengths[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+          litTable = buildTable(litLengths);
+          distTable = buildTable(new Array<number>(30).fill(5));
+        } else {
+          const hlit = getbits(5) + 257;
+          const hdist = getbits(5) + 1;
+          const hclen = getbits(4) + 4;
+          const clenLengths = new Array<number>(19).fill(0);
+          for (let i = 0; i < hclen; i += 1) clenLengths[CLEN_ORDER[i]!] = getbits(3);
+          const clenTable = buildTable(clenLengths);
+          const lengths = new Array<number>(hlit + hdist).fill(0);
+          let i = 0;
+          while (i < hlit + hdist) {
+            const symbol = decode(clenTable);
+            if (symbol < 16) {
+              lengths[i] = symbol;
+              i += 1;
+            } else if (symbol === 16) {
+              if (i === 0) return -1;
+              const previous = lengths[i - 1]!;
+              const repeat = 3 + getbits(2);
+              for (let j = 0; j < repeat; j += 1) {
+                if (i >= hlit + hdist) return -1;
+                lengths[i] = previous;
+                i += 1;
+              }
+            } else if (symbol === 17) {
+              i += 3 + getbits(3);
+            } else {
+              i += 11 + getbits(7);
+            }
+            if (i > hlit + hdist) return -1;
+          }
+          litTable = buildTable(lengths.slice(0, hlit));
+          distTable = buildTable(lengths.slice(hlit));
+        }
+        for (;;) {
+          const symbol = decode(litTable);
+          if (symbol < 256) continue;
+          if (symbol === 256) break;
+          const lengthIndex = symbol - 257;
+          if (lengthIndex >= 29) return -1;
+          getbits(LEN_EXT[lengthIndex]!);
+          const distSymbol = decode(distTable);
+          if (distSymbol >= 30) return -1;
+          getbits(DIST_EXT[distSymbol]!);
+        }
+      } else {
+        return -1;
+      }
+      if (bfinal) break;
+    }
+    const total = 2 + ((bitpos + 7) >> 3) + 4; // zlib header + deflate + adler32
+    return pos + total <= limit ? total : -1;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Inflate one pack entry starting at `pos`. The fast path walks the deflate stream to
+ * its exact end (zlibStreamLength) and inflates once; anything the walk cannot parse
+ * falls back to probing: inflateSync tolerates trailing bytes but throws on a truncated
+ * stream, so the consumed length is the smallest length that inflates — binary search.
  */
 function inflateEntry(buf: Buffer, pos: number, limit: number): { data: Buffer; consumed: number } {
+  const walked = zlibStreamLength(buf, pos, limit);
+  if (walked > 0) {
+    try {
+      return { data: inflateSync(buf.subarray(pos, pos + walked)), consumed: walked };
+    } catch {
+      // The walk disagreed with zlib: fall through to the probing path.
+    }
+  }
   let lo = 1;
   let hi = limit - pos;
   if (hi < 1) throw new Error('pack entry overruns the pack');
@@ -870,14 +1021,24 @@ function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentTy
 }
 
 function sendJsonRaw(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = JSON.stringify(body);
+  const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
+}
+
+/** Send an already-encoded JSON body with sendJsonRaw's exact headers. */
+function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': buf.length,
+    'x-github-request-id': nextRequestId(),
+  });
+  res.end(buf);
 }
 
 function sortedRefNames(repo: Repo): string[] {
@@ -913,8 +1074,11 @@ function advertisementLines(repo: Repo, service: 'git-upload-pack' | 'git-receiv
   return lines;
 }
 
-/** The protocol v2 capability advertisement for upload-pack. */
+let v2AdvertisementCache: Buffer | null = null;
+
+/** The protocol v2 capability advertisement for upload-pack (constant: built once). */
 function v2Advertisement(): Buffer {
+  if (v2AdvertisementCache !== null) return v2AdvertisementCache;
   const lines = [
     pktLine('version 2\n'),
     pktLine(`agent=${AGENT}\n`),
@@ -923,7 +1087,18 @@ function v2Advertisement(): Buffer {
     pktLine('object-format=sha1\n'),
     FLUSH_PKT,
   ];
-  return Buffer.concat(lines);
+  v2AdvertisementCache = Buffer.concat(lines);
+  return v2AdvertisementCache;
+}
+
+let v2InfoRefsCache: Buffer | null = null;
+
+/** The whole v2 info/refs response: constant bytes, built once. */
+function v2InfoRefs(): Buffer {
+  if (v2InfoRefsCache === null) {
+    v2InfoRefsCache = Buffer.concat([pktLine('# service=git-upload-pack\n'), FLUSH_PKT, v2Advertisement()]);
+  }
+  return v2InfoRefsCache;
 }
 
 function handleInfoRefs(res: ServerResponse, repo: Repo, service: string | null, protocol: string | null): void {
@@ -932,8 +1107,7 @@ function handleInfoRefs(res: ServerResponse, repo: Repo, service: string | null,
     return;
   }
   if (service === 'git-upload-pack' && protocol !== null && protocol.includes('version=2')) {
-    const banner = pktLine(`# service=git-upload-pack\n`);
-    sendBuffer(res, 200, Buffer.concat([banner, FLUSH_PKT, v2Advertisement()]), 'application/x-git-upload-pack-advertisement');
+    sendBuffer(res, 200, v2InfoRefs(), 'application/x-git-upload-pack-advertisement');
     return;
   }
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH_PKT, ...advertisementLines(repo, service), FLUSH_PKT];
@@ -1405,6 +1579,21 @@ function issueJson(repo: Repo, issue: IssueRec): Record<string, unknown> {
 
 const issueRestIds = new Map<string, number>();
 
+/**
+ * The issue's REST JSON as an encoded buffer, memoised on the record. The cache key is a
+ * fingerprint of every value issueJson renders (its fields, its comment count, and the
+ * repo's label epoch for the colours), so any mutation — REST, GraphQL or MCP, they all
+ * write these same fields — misses the cache and re-renders. Byte-identical output.
+ */
+function issueJsonBuffer(repo: Repo, issue: IssueRec): Buffer {
+  const key = `${issue.title}\u0000${issue.body}\u0000${issue.state}\u0000${issue.labels.join('\u0001')}\u0000${issue.comments.length}\u0000${repo.labelEpoch}`;
+  const cached = issue.jsonCache;
+  if (cached !== undefined && cached.key === key) return cached.buf;
+  const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)));
+  issue.jsonCache = { key, buf };
+  return buf;
+}
+
 function createIssueRec(repo: Repo, title: string, body: string, labels: string[]): IssueRec {
   const number = repo.nextNumber;
   repo.nextNumber += 1;
@@ -1838,6 +2027,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
       if (repo.labels.has(name)) return unprocessable(res, 'name has already been taken');
       const color = typeof body.color === 'string' ? body.color.replace(/^#/, '') : '000000';
       repo.labels.set(name, { name, color });
+      repo.labelEpoch += 1;
       sendJsonRaw(res, 201, { name, color });
       return;
     }
@@ -1861,7 +2051,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
           }
         }
         const issue = createIssueRec(repo, title, typeof body.body === 'string' ? body.body : '', labelNames);
-        sendJsonRaw(res, 201, issueJson(repo, issue));
+        sendJsonBuffer(res, 201, issueJsonBuffer(repo, issue));
         return;
       }
       if (method === 'GET') {
@@ -1882,7 +2072,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
       const issue = repo.issues.get(number);
       if (issue === undefined) return notFound(res);
       if (method === 'GET') {
-        sendJsonRaw(res, 200, issueJson(repo, issue));
+        sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
         return;
       }
       if (method === 'PATCH') {
@@ -1899,7 +2089,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
           }
           issue.labels = names;
         }
-        sendJsonRaw(res, 200, issueJson(repo, issue));
+        sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
         return;
       }
       return notFound(res);
@@ -3211,8 +3401,38 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 // The server: one router over the four surfaces
 // ---------------------------------------------------------------------------
 
+/**
+ * The single-issue GET route in its plainest shape (no percent-encoding, no dot
+ * segments, a decimal number): the one REST read a benchmark hammers. Anything that
+ * does not match this exactly takes the general route below, unchanged.
+ */
+const ISSUE_GET_RE = /^\/api\/v3\/repos\/([^/?%.]+)\/([^/?%.]+)\/issues\/([0-9]+)$/;
+
 export function createApp(): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // Fast path for GET /api/v3/repos/{owner}/{repo}/issues/{n}: it mirrors the general
+    // route's semantics step for step — the same auth check and 401, the REST handler's
+    // x-oauth-scopes header on every response past auth, the same repo-then-issue 404s,
+    // and the issue's memoised JSON — but skips re-parsing and re-dispatching the URL.
+    if (req.method === 'GET' && typeof req.url === 'string') {
+      const queryAt = req.url.indexOf('?');
+      const match = ISSUE_GET_RE.exec(queryAt >= 0 ? req.url.slice(0, queryAt) : req.url);
+      if (match !== null) {
+        if (!authed(req)) {
+          sendJsonRaw(res, 401, { message: 'Requires authentication' });
+          return;
+        }
+        res.setHeader('x-oauth-scopes', 'repo, read:org');
+        const repo = findRepo(match[1]!, match[2]!);
+        const issue = repo === null ? undefined : repo.issues.get(Number(match[3]!));
+        if (repo === null || issue === undefined) {
+          notFound(res);
+          return;
+        }
+        sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
+        return;
+      }
+    }
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
