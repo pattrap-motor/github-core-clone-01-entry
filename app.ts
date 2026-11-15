@@ -73,16 +73,19 @@ function readBody(req: IncomingMessage, limit = 96 * 1024 * 1024): Promise<Buffe
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
+
+/** The full expected Authorization header when a token is configured (built once). */
+const EXPECTED_AUTH_HEADER = EXPECTED_TOKEN === '' ? null : `Bearer ${EXPECTED_TOKEN}`;
 
 /** Whether the request carries the trial's bearer token. */
 function authed(req: IncomingMessage): boolean {
   const header = req.headers['authorization'];
   if (typeof header !== 'string') return false;
-  if (EXPECTED_TOKEN !== '') return header === `Bearer ${EXPECTED_TOKEN}`;
+  if (EXPECTED_AUTH_HEADER !== null) return header === EXPECTED_AUTH_HEADER;
   return header.startsWith('Bearer ') && header.length > 'Bearer '.length;
 }
 
@@ -172,8 +175,8 @@ interface IssueRec {
   labels: string[];
   comments: CommentRec[];
   createdTs: number;
-  /** Memoised REST JSON for this issue, keyed by a fingerprint of every field it renders. */
-  jsonCache?: { key: string; buf: Buffer };
+  /** Memoised REST JSON for this issue, with the rendered fields it was built from. */
+  jsonCache?: { title: string; body: string; state: string; labelsJoined: string; commentsLength: number; labelEpoch: number; buf: Buffer };
 }
 
 interface PullRec {
@@ -209,6 +212,13 @@ interface Repo {
   nextNumber: number;
   nextCommentId: number;
   packCache: Map<string, Buffer>;
+  /** Memoised parse results: stored objects are immutable, so these never go stale. */
+  commitCache: Map<string, CommitInfo>;
+  treeCache: Map<string, TreeEntry[]>;
+  /** Single-entry fetch plan/response cache, keyed by an exact state+args fingerprint. */
+  fetchCache?: { key: string; plan: FetchPlan; v2Done?: Buffer; v2Ack?: Buffer; v0?: Buffer };
+  /** Memoised v0 info/refs advertisements, keyed by an exact refs fingerprint. */
+  advCache?: { key: string; upload?: Buffer; receive?: Buffer };
 }
 
 const repos = new Map<string, Repo>();
@@ -240,6 +250,8 @@ function createRepoRec(owner: string, name: string, description: string, isPriva
     nextNumber: 1,
     nextCommentId: 1,
     packCache: new Map(),
+    commitCache: new Map(),
+    treeCache: new Map(),
   };
   nextRepoId += 1;
   repos.set(repoKey(owner, name), repo);
@@ -251,8 +263,11 @@ function createRepoRec(owner: string, name: string, description: string, isPriva
 // ---------------------------------------------------------------------------
 
 function objectId(type: ObjType, data: Buffer): string {
-  const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([head, data]));
+  // One hash, fed the header as a string and the payload as-is: no concatenated copy.
+  const hash = createHash('sha1');
+  hash.update(`${type} ${data.length}\0`, 'utf8');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
 function putObject(repo: Repo, type: ObjType, data: Buffer): string {
@@ -326,6 +341,28 @@ function parseTree(data: Buffer): TreeEntry[] {
 
 function isTreeMode(mode: string): boolean {
   return mode === '40000' || mode === '040000';
+}
+
+/** parseCommit memoised per repository (stored objects are immutable). */
+function commitInfo(repo: Repo, oid: string): CommitInfo | null {
+  const cached = repo.commitCache.get(oid);
+  if (cached !== undefined) return cached;
+  const obj = getObject(repo, oid);
+  if (obj === null || obj.type !== 'commit') return null;
+  const info = parseCommit(obj.data);
+  repo.commitCache.set(oid, info);
+  return info;
+}
+
+/** parseTree memoised per repository (stored objects are immutable). */
+function treeEntries(repo: Repo, oid: string): TreeEntry[] | null {
+  const cached = repo.treeCache.get(oid);
+  if (cached !== undefined) return cached;
+  const obj = getObject(repo, oid);
+  if (obj === null || obj.type !== 'tree') return null;
+  const entries = parseTree(obj.data);
+  repo.treeCache.set(oid, entries);
+  return entries;
 }
 
 /** Serialize tree entries in git's order (directories sort as if their name ended in '/'). */
@@ -451,7 +488,7 @@ function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
     seen.add(oid);
     const obj = getObject(repo, oid);
     if (obj === null || obj.type !== 'commit') continue;
-    for (const parent of parseCommit(obj.data).parents) queue.push(parent);
+    for (const parent of commitInfo(repo, oid)!.parents) queue.push(parent);
   }
   return false;
 }
@@ -528,12 +565,248 @@ const DIST_EXT: readonly number[] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6
 const CLEN_ORDER: readonly number[] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
 /**
+ * The exact byte length of the zlib stream starting at `buf[pos]`: the fast walker
+ * below first, the legacy bit-by-bit walker when the fast one declines (-1).
+ */
+function zlibStreamLength(buf: Buffer, pos: number, limit: number): number {
+  const fast = zlibStreamLengthFast(buf, pos, limit);
+  if (fast > 0) return fast;
+  return zlibStreamLengthLegacy(buf, pos, limit);
+}
+
+const WALK_LUT_BITS = 9;
+const WALK_LUT_SIZE = 1 << WALK_LUT_BITS;
+/** Bit-reversal table for WALK_LUT_BITS-wide peeked bit patterns. */
+const WALK_REV = new Uint16Array(WALK_LUT_SIZE);
+for (let i = 0; i < WALK_LUT_SIZE; i += 1) {
+  let r = 0;
+  for (let b = 0; b < WALK_LUT_BITS; b += 1) if ((i >> b) & 1) r |= 1 << (WALK_LUT_BITS - 1 - b);
+  WALK_REV[i] = r;
+}
+
+interface WalkTable {
+  /** (symbol << 4) | codeLength for codes up to WALK_LUT_BITS long; 0 = longer or invalid. */
+  lut: Int32Array;
+  counts: Int32Array;
+  symbols: Int32Array;
+  maxLen: number;
+}
+
+function newWalkTable(size: number): WalkTable {
+  return { lut: new Int32Array(WALK_LUT_SIZE), counts: new Int32Array(16), symbols: new Int32Array(size), maxLen: 0 };
+}
+
+/** (Re)build a canonical Huffman table + LUT from per-symbol code lengths. */
+function buildWalkTable(table: WalkTable, lengths: ArrayLike<number>, size: number): void {
+  const { counts, symbols, lut } = table;
+  counts.fill(0);
+  lut.fill(0);
+  let maxLen = 0;
+  let total = 0;
+  for (let s = 0; s < size; s += 1) {
+    const len = lengths[s]!;
+    if (len > 0) {
+      counts[len]! += 1;
+      total += 1;
+      if (len > maxLen) maxLen = len;
+    }
+  }
+  table.maxLen = maxLen;
+  const offsets = new Int32Array(16);
+  for (let i = 1; i < 16; i += 1) offsets[i] = offsets[i - 1]! + counts[i - 1]!;
+  const cursor = Int32Array.from(offsets);
+  for (let s = 0; s < size; s += 1) {
+    const len = lengths[s]!;
+    if (len > 0) {
+      symbols[cursor[len]!] = s;
+      cursor[len]! += 1;
+    }
+  }
+  // Canonical codes, assigned in (length, symbol) order — the order of `symbols`.
+  const next = new Int32Array(16);
+  let code = 0;
+  for (let len = 1; len < 16; len += 1) {
+    code = (code + counts[len - 1]!) << 1;
+    next[len] = code;
+  }
+  for (let i = 0; i < total; i += 1) {
+    const s = symbols[i]!;
+    const len = lengths[s]!;
+    const c = next[len]!;
+    next[len]! += 1;
+    if (len <= WALK_LUT_BITS) {
+      const base = c << (WALK_LUT_BITS - len);
+      const fill = 1 << (WALK_LUT_BITS - len);
+      const entry = (s << 4) | len;
+      for (let k = 0; k < fill; k += 1) lut[base + k] = entry;
+    }
+  }
+}
+
+const FIXED_LIT_LENGTHS = new Int32Array(288);
+for (let i = 0; i < 288; i += 1) FIXED_LIT_LENGTHS[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+const FIXED_DIST_LENGTHS = new Int32Array(30).fill(5);
+const fixedLitTable = newWalkTable(288);
+const fixedDistTable = newWalkTable(30);
+buildWalkTable(fixedLitTable, FIXED_LIT_LENGTHS, 288);
+buildWalkTable(fixedDistTable, FIXED_DIST_LENGTHS, 30);
+/** Scratch tables for dynamic blocks (the walker is never re-entered). */
+const dynLitTable = newWalkTable(288);
+const dynDistTable = newWalkTable(32);
+const dynClenTable = newWalkTable(19);
+const dynLengths = new Int32Array(320);
+const dynClenLengths = new Int32Array(19);
+
+/**
+ * zlibStreamLength's fast path: same contract (exact stream length, or -1 when the
+ * stream does not parse), but bits come from a 32-bit buffer and most Huffman symbols
+ * decode with a single LUT lookup instead of one closure call per bit. Codes longer
+ * than the LUT fall back to a canonical bit loop over the same buffer state.
+ */
+function zlibStreamLengthFast(buf: Buffer, pos: number, limit: number): number {
+  if (pos + 6 > limit) return -1;
+  if ((buf[pos]! & 0x0f) !== 8) return -1; // CMF: compression method must be deflate
+  const streamStart = pos + 2;
+  let nextByte = streamStart;
+  let bitbuf = 0;
+  let bitcnt = 0;
+  const refill = (): void => {
+    while (bitcnt <= 24 && nextByte < limit) {
+      bitbuf |= buf[nextByte]! << bitcnt;
+      nextByte += 1;
+      bitcnt += 8;
+    }
+  };
+  const getBits = (n: number): number => {
+    refill();
+    if (bitcnt < n) throw new Error('deflate stream overruns the pack');
+    const value = bitbuf & ((1 << n) - 1);
+    bitbuf >>>= n;
+    bitcnt -= n;
+    return value;
+  };
+  const decode = (table: WalkTable): number => {
+    refill();
+    if (bitcnt >= WALK_LUT_BITS) {
+      const entry = table.lut[WALK_REV[bitbuf & (WALK_LUT_SIZE - 1)]!]!;
+      if (entry !== 0) {
+        const len = entry & 0x0f;
+        bitbuf >>>= len;
+        bitcnt -= len;
+        return entry >> 4;
+      }
+    }
+    // Longer codes (and the short tail of the buffer): canonical bit-by-bit decode.
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    for (let length = 1; length <= table.maxLen; length += 1) {
+      refill();
+      if (bitcnt < 1) throw new Error('deflate stream overruns the pack');
+      code = (code << 1) | (bitbuf & 1);
+      bitbuf >>>= 1;
+      bitcnt -= 1;
+      const count = table.counts[length]!;
+      if (code - first < count) return table.symbols[index + (code - first)]!;
+      index += count;
+      first = (first + count) << 1;
+    }
+    throw new Error('invalid Huffman code in deflate stream');
+  };
+  try {
+    for (;;) {
+      const bfinal = getBits(1);
+      const btype = getBits(2);
+      if (btype === 0) {
+        // Stored block: align to a byte boundary, then LEN/NLEN and LEN payload bytes.
+        const drop = bitcnt & 7;
+        bitbuf >>>= drop;
+        bitcnt -= drop;
+        const p = nextByte - (bitcnt >> 3);
+        if (p + 4 > limit) return -1;
+        const len = buf[p]! | (buf[p + 1]! << 8);
+        const nlen = buf[p + 2]! | (buf[p + 3]! << 8);
+        if (len !== (~nlen & 0xffff)) return -1;
+        if (p + 4 + len > limit) return -1;
+        nextByte = p + 4 + len;
+        bitbuf = 0;
+        bitcnt = 0;
+      } else if (btype === 1 || btype === 2) {
+        let litTable: WalkTable;
+        let distTable: WalkTable;
+        if (btype === 1) {
+          litTable = fixedLitTable;
+          distTable = fixedDistTable;
+        } else {
+          const hlit = getBits(5) + 257;
+          const hdist = getBits(5) + 1;
+          const hclen = getBits(4) + 4;
+          dynClenLengths.fill(0);
+          for (let i = 0; i < hclen; i += 1) dynClenLengths[CLEN_ORDER[i]!] = getBits(3);
+          buildWalkTable(dynClenTable, dynClenLengths, 19);
+          const totalLengths = hlit + hdist;
+          let i = 0;
+          while (i < totalLengths) {
+            const symbol = decode(dynClenTable);
+            if (symbol < 16) {
+              dynLengths[i] = symbol;
+              i += 1;
+            } else if (symbol === 16) {
+              if (i === 0) return -1;
+              const previous = dynLengths[i - 1]!;
+              const repeat = 3 + getBits(2);
+              for (let j = 0; j < repeat; j += 1) {
+                if (i >= totalLengths) return -1;
+                dynLengths[i] = previous;
+                i += 1;
+              }
+            } else if (symbol === 17) {
+              const repeat = 3 + getBits(3);
+              for (let j = 0; j < repeat; j += 1) dynLengths[i + j] = 0;
+              i += repeat;
+            } else {
+              const repeat = 11 + getBits(7);
+              for (let j = 0; j < repeat; j += 1) dynLengths[i + j] = 0;
+              i += repeat;
+            }
+            if (i > totalLengths) return -1;
+          }
+          buildWalkTable(dynLitTable, dynLengths, hlit);
+          buildWalkTable(dynDistTable, dynLengths.subarray(hlit, totalLengths), hdist);
+          litTable = dynLitTable;
+          distTable = dynDistTable;
+        }
+        for (;;) {
+          const symbol = decode(litTable);
+          if (symbol < 256) continue;
+          if (symbol === 256) break;
+          const lengthIndex = symbol - 257;
+          if (lengthIndex >= 29) return -1;
+          getBits(LEN_EXT[lengthIndex]!);
+          const distSymbol = decode(distTable);
+          if (distSymbol >= 30) return -1;
+          getBits(DIST_EXT[distSymbol]!);
+        }
+      } else {
+        return -1;
+      }
+      if (bfinal) break;
+    }
+    const bitsUsed = (nextByte - streamStart) * 8 - bitcnt;
+    const total = 2 + ((bitsUsed + 7) >> 3) + 4; // zlib header + deflate + adler32
+    return pos + total <= limit ? total : -1;
+  } catch {
+    return -1;
+  }
+}
+
+/**
  * The exact byte length of the zlib stream starting at `buf[pos]`, found by walking the
  * deflate bitstream (block headers and Huffman symbols) without decoding any payload.
  * Returns -1 when the stream does not parse; callers fall back to probing inflateSync.
  * The walk never reads at or past `limit`.
  */
-function zlibStreamLength(buf: Buffer, pos: number, limit: number): number {
+function zlibStreamLengthLegacy(buf: Buffer, pos: number, limit: number): number {
   if (pos + 6 > limit) return -1;
   if ((buf[pos]! & 0x0f) !== 8) return -1; // CMF: compression method must be deflate
   let bitpos = 0; // bits consumed in the deflate stream (which starts after the 2-byte zlib header)
@@ -666,7 +939,15 @@ function zlibStreamLength(buf: Buffer, pos: number, limit: number): number {
  * falls back to probing: inflateSync tolerates trailing bytes but throws on a truncated
  * stream, so the consumed length is the smallest length that inflates — binary search.
  */
-function inflateEntry(buf: Buffer, pos: number, limit: number): { data: Buffer; consumed: number } {
+function inflateEntry(buf: Buffer, pos: number, limit: number, last = false): { data: Buffer; consumed: number } {
+  if (last) {
+    // The pack's final entry ends exactly at `limit`: no walk needed at all.
+    try {
+      return { data: inflateSync(buf.subarray(pos, limit)), consumed: limit - pos };
+    } catch {
+      // Not the clean end it should be: fall through to the walked path.
+    }
+  }
   const walked = zlibStreamLength(buf, pos, limit);
   if (walked > 0) {
     try {
@@ -767,6 +1048,9 @@ function parsePack(repo: Repo, buf: Buffer): Map<string, StoredObj> {
   if (!trailer.equals(digest)) throw new Error('pack trailer checksum mismatch');
 
   const entries: PackEntry[] = [];
+  const byOffset = new Map<number, PackEntry>();
+  const resolved = new Map<string, StoredObj>();
+  const resolvedByOffset = new Map<number, { oid: string; obj: StoredObj }>();
   let pos = 12;
   for (let i = 0; i < count; i += 1) {
     const start = pos;
@@ -794,21 +1078,25 @@ function parsePack(repo: Repo, buf: Buffer): Map<string, StoredObj> {
       baseOid = buf.toString('hex', pos, pos + 20);
       pos += 20;
     }
-    const { data, consumed } = inflateEntry(buf, pos, limit);
+    const { data, consumed } = inflateEntry(buf, pos, limit, i === count - 1);
     pos += consumed;
     if (typeId === 6 || typeId === 7) {
-      entries.push({ offset: start, typeId, data: null, baseOid, baseOffset, delta: data });
+      const entry: PackEntry = { offset: start, typeId, data: null, baseOid, baseOffset, delta: data };
+      entries.push(entry);
+      byOffset.set(start, entry);
     } else {
       const type = TYPE_NAMES[typeId];
       if (type === undefined) throw new Error(`unknown pack object type ${typeId}`);
-      entries.push({ offset: start, typeId, data, baseOid: null, baseOffset: null, delta: null });
+      const entry: PackEntry = { offset: start, typeId, data, baseOid: null, baseOffset: null, delta: null };
+      entries.push(entry);
+      byOffset.set(start, entry);
+      // Plain entries resolve immediately: no second pass, no re-hashing later.
+      const obj: StoredObj = { type, data };
+      const oid = objectId(type, data);
+      resolved.set(oid, obj);
+      resolvedByOffset.set(start, { oid, obj });
     }
   }
-
-  const byOffset = new Map<number, PackEntry>();
-  for (const entry of entries) byOffset.set(entry.offset, entry);
-  const resolved = new Map<string, StoredObj>();
-  const resolvedByOffset = new Map<number, { oid: string; obj: StoredObj }>();
 
   const resolveEntry = (entry: PackEntry, depth: number): { oid: string; obj: StoredObj } => {
     const cached = resolvedByOffset.get(entry.offset);
@@ -824,9 +1112,9 @@ function parsePack(repo: Repo, buf: Buffer): Map<string, StoredObj> {
         if (baseEntry === undefined) throw new Error('OFS_DELTA base not in pack');
         base = resolveEntry(baseEntry, depth + 1).obj;
       } else if (entry.baseOid !== null) {
-        const inPack = [...entries].find((candidate) => candidate.data !== null && objectId(TYPE_NAMES[candidate.typeId]!, candidate.data) === entry.baseOid);
-        if (inPack !== undefined) base = resolveEntry(inPack, depth + 1).obj;
-        else base = getObject(repo, entry.baseOid);
+        // Plain in-pack bases are already resolved (see the parse loop); a delta
+        // base was never matchable here, so fall back to the repository store.
+        base = resolved.get(entry.baseOid) ?? getObject(repo, entry.baseOid);
       }
       if (base === null) throw new Error('delta base not found');
       obj = { type: base.type, data: applyDelta(base.data, entry.delta!) };
@@ -857,7 +1145,7 @@ function addTreeClosure(repo: Repo, treeOid: string, set: Set<string>): void {
     if (obj === null) continue;
     set.add(oid);
     if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+      for (const entry of treeEntries(repo, oid)!) stack.push(entry.oid);
     }
   }
 }
@@ -874,11 +1162,11 @@ function addFullClosure(repo: Repo, rootOid: string, set: Set<string>): void {
     if (obj === null) continue;
     set.add(oid);
     if (obj.type === 'commit') {
-      const info = parseCommit(obj.data);
+      const info = commitInfo(repo, oid)!;
       stack.push(info.tree);
       for (const parent of info.parents) stack.push(parent);
     } else if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+      for (const entry of treeEntries(repo, oid)!) stack.push(entry.oid);
     } else if (obj.type === 'tag') {
       stack.push(peelOne(repo, oid));
     }
@@ -914,7 +1202,7 @@ function planFetch(
     commonHaves.push(have);
     if (obj.type === 'commit' && shallowReq.has(have)) {
       exclude.add(have);
-      addTreeClosure(repo, parseCommit(obj.data).tree, exclude);
+      addTreeClosure(repo, commitInfo(repo, have)!.tree, exclude);
     } else {
       addFullClosure(repo, have, exclude);
     }
@@ -931,7 +1219,7 @@ function planFetch(
     if (obj === null || obj.type !== 'commit') return;
     include.add(commitOid);
     includedCommits.add(commitOid);
-    addTreeClosure(repo, parseCommit(obj.data).tree, include);
+    addTreeClosure(repo, commitInfo(repo, commitOid)!.tree, include);
   };
 
   // Resolve want roots: tags peel to commits for the depth walk; every want's own
@@ -961,7 +1249,7 @@ function planFetch(
       for (const commitOid of frontier) {
         const obj = getObject(repo, commitOid);
         if (obj === null || obj.type !== 'commit') continue;
-        for (const parent of parseCommit(obj.data).parents) {
+        for (const parent of commitInfo(repo, commitOid)!.parents) {
           if (!includedCommits.has(parent)) {
             includeCommit(parent);
             next.push(parent);
@@ -978,7 +1266,7 @@ function planFetch(
       if (includedCommits.has(commitOid)) continue;
       const obj = getObject(repo, commitOid);
       if (obj === null || obj.type !== 'commit') continue;
-      const info = parseCommit(obj.data);
+      const info = commitInfo(repo, commitOid)!;
       if (info.timestamp <= deepenSince) continue;
       includeCommit(commitOid);
       for (const parent of info.parents) stack.push(parent);
@@ -997,7 +1285,7 @@ function planFetch(
   for (const commitOid of includedCommits) {
     const obj = getObject(repo, commitOid);
     if (obj === null || obj.type !== 'commit') continue;
-    const parents = parseCommit(obj.data).parents;
+    const parents = commitInfo(repo, commitOid)!.parents;
     if (parents.length === 0) continue;
     const allAvailable = parents.every((parent) => include.has(parent) || exclude.has(parent));
     if (!allAvailable && !shallowReq.has(commitOid)) shallow.push(commitOid);
@@ -1110,8 +1398,25 @@ function handleInfoRefs(res: ServerResponse, repo: Repo, service: string | null,
     sendBuffer(res, 200, v2InfoRefs(), 'application/x-git-upload-pack-advertisement');
     return;
   }
+  // The v0 advertisement depends only on the branch head and the ref set (object
+  // types are fixed per oid), so the whole body is memoised per exact fingerprint.
+  let fingerprint = `${service}|${repo.defaultBranch}|`;
+  for (const [name, oid] of repo.refs) fingerprint += `${name}=${oid};`;
+  const cache = repo.advCache;
+  if (cache !== undefined && cache.key === fingerprint) {
+    const hit = service === 'git-upload-pack' ? cache.upload : cache.receive;
+    if (hit !== undefined) {
+      sendBuffer(res, 200, hit, `application/x-${service}-advertisement`);
+      return;
+    }
+  }
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH_PKT, ...advertisementLines(repo, service), FLUSH_PKT];
-  sendBuffer(res, 200, Buffer.concat(parts), `application/x-${service}-advertisement`);
+  const body = Buffer.concat(parts);
+  const entry = cache !== undefined && cache.key === fingerprint ? cache : { key: fingerprint };
+  if (service === 'git-upload-pack') entry.upload = body;
+  else entry.receive = body;
+  repo.advCache = entry;
+  sendBuffer(res, 200, body, `application/x-${service}-advertisement`);
 }
 
 /** One ls-refs answer line set, honouring ref-prefix filtering like git does. */
@@ -1190,9 +1495,44 @@ function fetchPack(repo: Repo, plan: FetchPlan, args: FetchArgs): Buffer {
   return pack;
 }
 
+/**
+ * Exact fingerprint of the repository state a fetch answer can depend on: every
+ * mutation adds/removes an object or moves a ref, so size + refs pin the state.
+ */
+function repoStateKey(repo: Repo): string {
+  let key = `${repo.objects.size}|`;
+  for (const [name, oid] of repo.refs) key += `${name}=${oid};`;
+  return key;
+}
+
+/** Canonical key for one fetch request's arguments (order preserved, as sent). */
+function fetchArgsKey(args: FetchArgs): string {
+  return JSON.stringify([args.wants, args.haves, [...args.shallow], args.deepen, args.deepenSince, args.deepenNot, args.done]);
+}
+
+/** The cached fetch entry for this exact state+args, when present. */
+function fetchCacheHit(repo: Repo, args: FetchArgs): { key: string; entry?: NonNullable<Repo['fetchCache']> } {
+  const key = `${repoStateKey(repo)}#${fetchArgsKey(args)}`;
+  const entry = repo.fetchCache;
+  return { key, entry: entry !== undefined && entry.key === key ? entry : undefined };
+}
+
+function storeFetchCache(repo: Repo, key: string, plan: FetchPlan, slot: 'v2Done' | 'v2Ack' | 'v0', body: Buffer): void {
+  const prev = repo.fetchCache;
+  const entry = prev !== undefined && prev.key === key ? prev : { key, plan };
+  entry.plan = plan;
+  entry[slot] = body;
+  repo.fetchCache = entry;
+}
+
 /** The v2 fetch response: acknowledgments / shallow-info / packfile sections. */
 function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer {
-  const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.deepen, args.deepenSince, args.deepenNot);
+  const { key, entry } = fetchCacheHit(repo, args);
+  if (entry !== undefined) {
+    const hit = args.done ? entry.v2Done : entry.v2Ack;
+    if (hit !== undefined) return hit;
+  }
+  const plan = entry !== undefined ? entry.plan : planFetch(repo, args.wants, args.haves, args.shallow, args.deepen, args.deepenSince, args.deepenNot);
   // Negotiation round (wait-for-done): without `done` the client is still offering
   // haves, so the answer is the acknowledgments alone — no `ready`, no packfile yet.
   if (!args.done) {
@@ -1203,7 +1543,9 @@ function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer {
       parts.push(pktLine('NAK\n'));
     }
     parts.push(FLUSH_PKT);
-    return Buffer.concat(parts);
+    const body = Buffer.concat(parts);
+    storeFetchCache(repo, key, plan, 'v2Ack', body);
+    return body;
   }
   // Sections are separated by a delimiter packet; only the last one ends in a flush.
   const sections: Buffer[][] = [];
@@ -1227,12 +1569,16 @@ function v2FetchResponse(repo: Repo, args: FetchArgs): Buffer {
     parts.push(...section);
     parts.push(index === sections.length - 1 ? FLUSH_PKT : DELIM_PKT);
   });
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  storeFetchCache(repo, key, plan, 'v2Done', body);
+  return body;
 }
 
 /** The v0 fetch response: shallow lines, a NAK, then the pack in sideband band 1. */
 function v0FetchResponse(repo: Repo, args: FetchArgs): Buffer {
-  const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.deepen, args.deepenSince, args.deepenNot);
+  const { key, entry } = fetchCacheHit(repo, args);
+  if (entry !== undefined && entry.v0 !== undefined) return entry.v0;
+  const plan = entry !== undefined ? entry.plan : planFetch(repo, args.wants, args.haves, args.shallow, args.deepen, args.deepenSince, args.deepenNot);
   const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
@@ -1242,7 +1588,9 @@ function v0FetchResponse(repo: Repo, args: FetchArgs): Buffer {
     for (const packet of sidebandPackets(pack)) parts.push(packet);
   }
   parts.push(FLUSH_PKT);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  storeFetchCache(repo, key, plan, 'v0', body);
+  return body;
 }
 
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo): Promise<void> {
@@ -1586,11 +1934,28 @@ const issueRestIds = new Map<string, number>();
  * write these same fields — misses the cache and re-renders. Byte-identical output.
  */
 function issueJsonBuffer(repo: Repo, issue: IssueRec): Buffer {
-  const key = `${issue.title}\u0000${issue.body}\u0000${issue.state}\u0000${issue.labels.join('\u0001')}\u0000${issue.comments.length}\u0000${repo.labelEpoch}`;
   const cached = issue.jsonCache;
-  if (cached !== undefined && cached.key === key) return cached.buf;
+  if (
+    cached !== undefined &&
+    cached.title === issue.title &&
+    cached.body === issue.body &&
+    cached.state === issue.state &&
+    cached.commentsLength === issue.comments.length &&
+    cached.labelEpoch === repo.labelEpoch &&
+    cached.labelsJoined === issue.labels.join('\u0001')
+  ) {
+    return cached.buf;
+  }
   const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)));
-  issue.jsonCache = { key, buf };
+  issue.jsonCache = {
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labelsJoined: issue.labels.join('\u0001'),
+    commentsLength: issue.comments.length,
+    labelEpoch: repo.labelEpoch,
+    buf,
+  };
   return buf;
 }
 
@@ -3408,6 +3773,9 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
  */
 const ISSUE_GET_RE = /^\/api\/v3\/repos\/([^/?%.]+)\/([^/?%.]+)\/issues\/([0-9]+)$/;
 
+/** The issue-creation route in the same plain shape: POST /api/v3/repos/{o}/{r}/issues. */
+const ISSUE_POST_RE = /^\/api\/v3\/repos\/([^/?%.]+)\/([^/?%.]+)\/issues$/;
+
 export function createApp(): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     // Fast path for GET /api/v3/repos/{owner}/{repo}/issues/{n}: it mirrors the general
@@ -3430,6 +3798,52 @@ export function createApp(): Server {
           return;
         }
         sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
+        return;
+      }
+    }
+    // Fast path for POST /api/v3/repos/{owner}/{repo}/issues, mirroring the general
+    // route step for step (auth 401 without the scopes header, then the header on
+    // every later response, repo 404, the same body/title/label validation, the same
+    // 201 with the memoised issue JSON) without URL parsing and route dispatch.
+    if (req.method === 'POST' && typeof req.url === 'string') {
+      const queryAt = req.url.indexOf('?');
+      const match = ISSUE_POST_RE.exec(queryAt >= 0 ? req.url.slice(0, queryAt) : req.url);
+      if (match !== null) {
+        if (!authed(req)) {
+          sendJsonRaw(res, 401, { message: 'Requires authentication' });
+          return;
+        }
+        res.setHeader('x-oauth-scopes', 'repo, read:org');
+        const repo = findRepo(match[1]!, match[2]!);
+        if (repo === null) {
+          notFound(res);
+          return;
+        }
+        void (async () => {
+          try {
+            const body = await jsonBody(req, res);
+            if (body === undefined) return;
+            const title = typeof body.title === 'string' ? body.title : '';
+            if (title === '') return unprocessable(res, 'title is required');
+            const labelNames: string[] = [];
+            if (Array.isArray(body.labels)) {
+              for (const raw of body.labels) {
+                const name = typeof raw === 'string' ? raw : isRecord(raw) && typeof raw.name === 'string' ? raw.name : '';
+                if (name === '' || !repo.labels.has(name)) return unprocessable(res, `label ${name} does not exist`);
+                labelNames.push(name);
+              }
+            }
+            const issue = createIssueRec(repo, title, typeof body.body === 'string' ? body.body : '', labelNames);
+            sendJsonBuffer(res, 201, issueJsonBuffer(repo, issue));
+          } catch (err) {
+            try {
+              if (!res.headersSent) sendJsonRaw(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+              else res.end();
+            } catch {
+              // The socket is already gone; nothing more to do.
+            }
+          }
+        })();
         return;
       }
     }
